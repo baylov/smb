@@ -16,7 +16,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import config
 import db
-from data_models import TariffType, PaymentStatus, SubscriptionStatus, TariffCallback, PaymentConfirmationCallback
+from data_models import TariffType, PaymentStatus, SubscriptionStatus, TariffCallback, PaymentConfirmationCallback, AdminApprovalCallback
 from states import PaymentFlow
 
 logger = logging.getLogger(__name__)
@@ -29,6 +29,60 @@ BUY_ACCESS_CALLBACK = "buy_access"
 MY_SUBSCRIPTION_CALLBACK = "my_subscription"
 RECEIPT_UPLOAD_CALLBACK = "receipt_upload"
 CANCEL_PAYMENT_CALLBACK = "cancel_payment"
+
+
+async def send_admin_payment_notification(
+    bot: Bot,
+    user_id: int,
+    username: str,
+    tariff: str,
+    receipt_file_id: str
+) -> bool:
+    """Send payment notification to admin with receipt.
+    
+    Args:
+        bot: Bot instance
+        user_id: User ID who submitted payment
+        username: Username of the user
+        tariff: Selected tariff type
+        receipt_file_id: Telegram file ID of the receipt
+        
+    Returns:
+        True if notification sent successfully, False otherwise
+    """
+    try:
+        notification_text = (
+            f"💳 <b>New Payment Request</b>\n\n"
+            f"👤 <b>User:</b> @{username} (ID: {user_id})\n"
+            f"🎯 <b>Plan:</b> {tariff.title()}\n"
+            f"📅 <b>Date:</b> {date.today()}\n\n"
+            f"Please review the payment receipt below and approve or decline."
+        )
+        
+        # Create admin approval keyboard
+        kb = InlineKeyboardBuilder()
+        approve_data = AdminApprovalCallback(action="approve", user_id=user_id).pack()
+        decline_data = AdminApprovalCallback(action="decline", user_id=user_id).pack()
+        
+        kb.button(text="✅ Approve", callback_data=approve_data)
+        kb.button(text="❌ Decline", callback_data=decline_data)
+        kb.adjust(1)
+        
+        # Send notification to admin with receipt
+        await bot.send_photo(
+            chat_id=config.ADMIN_ID,
+            photo=receipt_file_id,
+            caption=notification_text,
+            reply_markup=kb.as_markup(),
+            parse_mode="HTML"
+        )
+        
+        logger.info(f"Payment notification sent to admin for user {user_id}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to send payment notification to admin: {e}")
+        return False
 
 
 def format_subscription_message(subscriber_data: Dict[str, Any]) -> str:
@@ -499,13 +553,10 @@ async def handle_receipt_photo(message: Message, state: FSMContext) -> None:
         
         await message.answer(confirmation_text, parse_mode="HTML")
         
-        # Log for admin (in real implementation, would send to admin)
-        logger.info(f"Payment receipt submitted by user {user_id} for {payment_data.get('tariff')} plan")
+        # Send notification to admin about new payment
+        await send_admin_payment_notification(message.bot, user_id, username, payment_data.get("tariff", "Unknown"), file_id)
         
-        # TODO: In a complete implementation, you would also:
-        # 1. Store receipt file_id in a payments table
-        # 2. Send notification to admin about new payment
-        # 3. Implement admin approval workflow
+        logger.info(f"Payment receipt submitted by user {user_id} for {payment_data.get('tariff')} plan")
         
     except Exception as e:
         logger.error(f"Error processing receipt for user {user_id}: {e}")
@@ -530,8 +581,62 @@ async def handle_receipt_document(message: Message, state: FSMContext) -> None:
     # Check if it's an image file (some users might send images as documents)
     document = message.document
     if document.mime_type and document.mime_type.startswith('image/'):
-        # Treat as image
-        return await handle_receipt_photo(message, state)
+        # Get payment data from state
+        data = await state.get_data()
+        payment_data = data.get("payment_data", {})
+        
+        # Update subscription status to pending
+        success = db.update_subscriber_status(user_id, "pending")
+        if not success:
+            logger.error(f"Failed to update subscriber status for user {user_id}")
+        
+        # Calculate subscription dates
+        today = date.today()
+        if payment_data.get("tariff") == "monthly":
+            end_date = today + timedelta(days=config.MONTHLY_DAYS)
+        else:
+            end_date = None  # Lifetime subscription
+        
+        # Update subscription dates and type
+        db.update_subscription_dates(
+            user_id=user_id,
+            start_date=today,
+            end_date=end_date,
+            subscription_type=payment_data.get("tariff", "monthly")
+        )
+        
+        # Clear state
+        await state.clear()
+        
+        # Send confirmation message
+        confirmation_text = (
+            "✅ <b>Receipt Received!</b>\n\n"
+            "📋 <b>Details:</b>\n"
+            f"• User: @{username} ({user_id})\n"
+            f"• Plan: {payment_data.get('tariff', 'Unknown')}\n"
+            f"• Amount: ${payment_data.get('price', 'Unknown')}\n"
+            f"• Receipt: Uploaded successfully\n\n"
+            "⏳ <b>Next Steps:</b>\n"
+            "• Your payment is being reviewed by our admin\n"
+            "• Processing typically takes up to 24 hours\n"
+            "• You'll be notified once approved\n"
+            "• Check back with /mysubscription for updates\n\n"
+            "🙏 Thank you for your patience!"
+        )
+        
+        await message.answer(confirmation_text, parse_mode="HTML")
+        
+        # Send notification to admin about new payment
+        await send_admin_payment_notification(
+            message.bot, 
+            user_id, 
+            username, 
+            payment_data.get("tariff", "Unknown"), 
+            document.file_id
+        )
+        
+        logger.info(f"Payment receipt document submitted by user {user_id} for {payment_data.get('tariff')} plan")
+        return
     
     logger.info(f"User {user_id} (@{username}) uploaded non-image document: {document.file_name}")
     
