@@ -42,17 +42,21 @@ def get_fsm_storage(redis_url: Optional[str] = None) -> BaseStorage:
     
     if redis_url:
         try:
-            from aiogram.fsm.storage.redis import RedisStorage
-            from redis.asyncio import Redis
+            # Check if redis package is available
+            import redis.asyncio
             
-            redis = Redis.from_url(redis_url, decode_responses=True)
-            storage = RedisStorage(redis=redis)
+            # Check if aiogram Redis storage is available  
+            from aiogram.fsm.storage.redis import RedisStorage
+            
+            # Create Redis connection and storage
+            redis_client = redis.asyncio.Redis.from_url(redis_url, decode_responses=True)
+            storage = RedisStorage(redis=redis_client)
             logger.info("Using Redis FSM storage: %s", redis_url)
             return storage
         except ImportError:
             logger.warning(
-                "Redis URL provided but redis package not installed. "
-                "Install with: pip install redis. Falling back to MemoryStorage."
+                "Redis not available. Install with: pip install redis. "
+                "Falling back to MemoryStorage."
             )
         except Exception as e:
             logger.error(
